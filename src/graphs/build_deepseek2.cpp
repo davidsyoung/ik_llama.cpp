@@ -137,56 +137,136 @@ ggml_tensor * llm_build_context::build_deepseek2_tp_attention(
                 row_size_cache, 0);
         cb(kv_cache, "kv_cache", il_id);
 
-        // wk_b is replicated (split_dim=-1); each rank views its n_head_local heads.
-        // head_stride = nb[1] * kv_lora_rank works for both 2D and 3D wk_b layouts.
-        auto wk_b_split = (const ggml_split_tensor_t *)model.layers[il].wk_b->extra;
-        GGML_ASSERT(wk_b_split);
-        ggml_tensor * wk_b_local = wk_b_split->splits[id];
         const int head_offset = head_offsets[id];
-        const size_t wk_b_head_stride = wk_b_local->nb[1] * kv_lora_rank;
-        ggml_tensor * wk_b_slice = ggml_view_3d(ctx0, wk_b_local,
-                n_embd_head_qk_nope, kv_lora_rank, n_head_local,
-                wk_b_local->nb[1], wk_b_head_stride,
-                head_offset * wk_b_head_stride);
-        cb(wk_b_slice, "wk_b_slice", il_id);
+        static const bool disable_pp_opt = getenv("GGML_DISABLE_TP_PP_OPT") != nullptr;
+        const bool pp_opt = !disable_pp_opt && n_tokens >= 128;
 
-        ggml_tensor * q_nope_perm = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
+        ggml_tensor * kqv_2d;
 
-        ggml_tensor * q_nope2 = ggml_mul_mat(ctx0, wk_b_slice, q_nope_perm);
+        if (pp_opt && model.layers[il].split_wkv_b.ggml.splits) {
+            // mla=2/3 PP path: materialize K/V per rank from compressed cache via wkv_b.
+            const auto * wkv_b_split = (const ggml_split_tensor_t *)&model.layers[il].split_wkv_b.ggml;
+            ggml_tensor * wkv_b_local = wkv_b_split->splits[id];
+            GGML_ASSERT(wkv_b_local);
 
-        ggml_tensor * q_combined = ggml_concat(ctx0,
-                ggml_permute(ctx0, q_rope, 0, 2, 1, 3), q_nope2, 0);
+            const int n_embd_head_v_full = hparams.n_embd_head_v_full;
+            const int n_per_head = n_embd_head_qk_nope + n_embd_head_v_full;
 
-        // FlashMLA-3 path: K = kv_cache (full latent + rope), V = kv_cache_lora (latent only)
-        ggml_tensor * kv_cache_lora = ggml_view_2d(ctx0, cache_local,
-                kv_lora_rank, n_kv,
-                row_size_cache,
-                ggml_row_size(cache_local->type, n_embd_head_qk_rope));
-        cb(kv_cache_lora, "kv_cache_lora", il_id);
+            ggml_tensor * wkv_b_slice = ggml_view_2d(ctx0, wkv_b_local,
+                    wkv_b_local->ne[0],
+                    n_head_local * n_per_head,
+                    wkv_b_local->nb[1],
+                    wkv_b_local->nb[1] * head_offset * n_per_head);
+            cb(wkv_b_slice, "wkv_b_slice", il_id);
 
-        ggml_tensor * kqv_compressed = ggml_flash_attn_ext(ctx0,
-                q_combined, kv_cache, kv_cache_lora, KQ_mask,
-                kq_scale, hparams.f_max_alibi_bias, 0.f);
-        cb(kqv_compressed, "kqv_compressed", il_id);
-        if (use_f32_attn_precision) {
-            ggml_flash_attn_ext_set_prec(kqv_compressed, GGML_PREC_F32);
+            ggml_tensor * kv_cache_nope = ggml_view_2d(ctx0, cache_local,
+                    kv_lora_rank, n_kv,
+                    row_size_cache,
+                    ggml_row_size(cache_local->type, n_embd_head_qk_rope));
+            cb(kv_cache_nope, "kv_cache_nope_pp", il_id);
+
+            ggml_tensor * kv_cache_rope_view = ggml_view_3d(ctx0, cache_local,
+                    n_embd_head_qk_rope, n_kv, 1,
+                    row_size_cache,
+                    cache_local->nb[2],
+                    0);
+            cb(kv_cache_rope_view, "kv_cache_rope_pp", il_id);
+
+            const auto kv_type = GGML_TYPE_F16;
+
+            ggml_tensor * kv_f32 = ggml_mul_mat(ctx0, wkv_b_slice, kv_cache_nope);
+            cb(kv_f32, "kv_f32_pp", il_id);
+
+            ggml_tensor * v_f32 = ggml_view_3d(ctx0, kv_f32, n_embd_head_v_full, n_kv, n_head_local,
+                    ggml_row_size(kv_f32->type, n_head_local * n_per_head),
+                    ggml_row_size(kv_f32->type, n_per_head),
+                    ggml_row_size(kv_f32->type, n_embd_head_qk_nope));
+            ggml_tensor * k_nope_f32 = ggml_view_3d(ctx0, kv_f32, n_embd_head_qk_nope, n_kv, n_head_local,
+                    ggml_row_size(kv_f32->type, n_head_local * n_per_head),
+                    ggml_row_size(kv_f32->type, n_per_head),
+                    0);
+
+            ggml_tensor * v      = ggml_cast(ctx0, v_f32,      kv_type);
+            ggml_tensor * k_nope = ggml_cast(ctx0, k_nope_f32, kv_type);
+            ggml_build_forward_expand(gf, v);
+            ggml_build_forward_expand(gf, k_nope);
+
+            ggml_tensor repeater;
+            repeater.ne[0] = n_embd_head_qk_rope; repeater.ne[1] = n_kv; repeater.ne[2] = n_head_local; repeater.ne[3] = 1;
+            ggml_tensor * k_rope_rep;
+            if (kv_cache_rope_view->type == kv_type) {
+                k_rope_rep = ggml_repeat(ctx0, kv_cache_rope_view, &repeater);
+            } else {
+                auto kv_rope_kvt = ggml_cast(ctx0, kv_cache_rope_view, kv_type);
+                k_rope_rep = ggml_repeat(ctx0, kv_rope_kvt, &repeater);
+            }
+            cb(k_rope_rep, "k_rope_rep", il_id);
+
+            ggml_tensor * k = ggml_concat(ctx0, k_rope_rep, k_nope, 0);
+            cb(k, "k_full_pp", il_id);
+            ggml_build_forward_expand(gf, k);
+
+            ggml_tensor * q = ggml_concat(ctx0, q_rope, q_nope, 0);
+            q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+            cb(q, "q_concat_pp", il_id);
+            ggml_build_forward_expand(gf, q);
+
+            ggml_tensor * kqv = ggml_flash_attn_ext(ctx0, q, k, v, KQ_mask,
+                    kq_scale, hparams.f_max_alibi_bias, 0.f);
+            if (use_f32_attn_precision || q->ne[1] <= 8) {
+                ggml_flash_attn_ext_set_prec(kqv, GGML_PREC_F32);
+            }
+            cb(kqv, "kqv_pp", il_id);
+
+            kqv_2d = ggml_reshape_2d(ctx0, kqv, n_embd_head_v_full * n_head_local, n_tokens);
+        } else {
+            // TG path: absorb (576/512 FlashMLA-3 on dual-view cache).
+            auto wk_b_split = (const ggml_split_tensor_t *)model.layers[il].wk_b->extra;
+            GGML_ASSERT(wk_b_split);
+            ggml_tensor * wk_b_local = wk_b_split->splits[id];
+            const size_t wk_b_head_stride = wk_b_local->nb[1] * kv_lora_rank;
+            ggml_tensor * wk_b_slice = ggml_view_3d(ctx0, wk_b_local,
+                    n_embd_head_qk_nope, kv_lora_rank, n_head_local,
+                    wk_b_local->nb[1], wk_b_head_stride,
+                    head_offset * wk_b_head_stride);
+            cb(wk_b_slice, "wk_b_slice", il_id);
+
+            ggml_tensor * q_nope_perm = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
+            ggml_tensor * q_nope2 = ggml_mul_mat(ctx0, wk_b_slice, q_nope_perm);
+
+            ggml_tensor * q_combined = ggml_concat(ctx0,
+                    ggml_permute(ctx0, q_rope, 0, 2, 1, 3), q_nope2, 0);
+
+            ggml_tensor * kv_cache_lora = ggml_view_2d(ctx0, cache_local,
+                    kv_lora_rank, n_kv,
+                    row_size_cache,
+                    ggml_row_size(cache_local->type, n_embd_head_qk_rope));
+            cb(kv_cache_lora, "kv_cache_lora", il_id);
+
+            ggml_tensor * kqv_compressed = ggml_flash_attn_ext(ctx0,
+                    q_combined, kv_cache, kv_cache_lora, KQ_mask,
+                    kq_scale, hparams.f_max_alibi_bias, 0.f);
+            cb(kqv_compressed, "kqv_compressed", il_id);
+            if (use_f32_attn_precision) {
+                ggml_flash_attn_ext_set_prec(kqv_compressed, GGML_PREC_F32);
+            }
+            kqv_compressed = ggml_permute(ctx0, kqv_compressed, 0, 2, 1, 3);
+
+            auto wv_b_split = (const ggml_split_tensor_t *)model.layers[il].wv_b->extra;
+            GGML_ASSERT(wv_b_split);
+            ggml_tensor * wv_b_local = wv_b_split->splits[id];
+            const size_t wv_b_head_stride = wv_b_local->nb[1] * n_embd_head_v;
+            ggml_tensor * wv_b_slice = ggml_view_3d(ctx0, wv_b_local,
+                    kv_lora_rank, n_embd_head_v, n_head_local,
+                    wv_b_local->nb[1], wv_b_head_stride,
+                    head_offset * wv_b_head_stride);
+
+            ggml_tensor * kqv = ggml_mul_mat(ctx0, wv_b_slice, kqv_compressed);
+            if (n_tokens > 1) {
+                kqv = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3));
+            }
+            kqv_2d = ggml_reshape_2d(ctx0, kqv, n_embd_head_v * n_head_local, n_tokens);
         }
-        kqv_compressed = ggml_permute(ctx0, kqv_compressed, 0, 2, 1, 3);
-
-        auto wv_b_split = (const ggml_split_tensor_t *)model.layers[il].wv_b->extra;
-        GGML_ASSERT(wv_b_split);
-        ggml_tensor * wv_b_local = wv_b_split->splits[id];
-        const size_t wv_b_head_stride = wv_b_local->nb[1] * n_embd_head_v;
-        ggml_tensor * wv_b_slice = ggml_view_3d(ctx0, wv_b_local,
-                kv_lora_rank, n_embd_head_v, n_head_local,
-                wv_b_local->nb[1], wv_b_head_stride,
-                head_offset * wv_b_head_stride);
-
-        ggml_tensor * kqv = ggml_mul_mat(ctx0, wv_b_slice, kqv_compressed);
-        if (n_tokens > 1) {
-            kqv = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3));
-        }
-        ggml_tensor * kqv_2d = ggml_reshape_2d(ctx0, kqv, n_embd_head_v * n_head_local, n_tokens);
 
         ggml_tensor * partial = llm_build_lora_mm(lctx, ctx0, wo_split->splits[id], kqv_2d);
 

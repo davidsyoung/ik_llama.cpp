@@ -2429,6 +2429,7 @@ static void llm_prepare_mla(llama_model & model, int mla) {
         }
         ggml_free(ctx);
     }
+
     if (mla == 1) return;
 
     n_to_compute = 0;
@@ -2563,6 +2564,66 @@ static void llm_prepare_mla(llama_model & model, int mla) {
         ggml_graph_clear(graph);
     }
     ggml_free(ctx);
+}
+
+// Replicate wkv_b across devices so build_deepseek2_tp_attention's pp_opt path can take
+// per-rank slices. Called after llm_prepare_mla so wkv_b is guaranteed present.
+static void llm_replicate_wkv_b_for_graph(llama_model & model) {
+    if (model.split_mode != LLAMA_SPLIT_MODE_GRAPH && model.split_mode != LLAMA_SPLIT_MODE_ATTN) return;
+    const int n_layer = model.hparams.n_layer;
+    std::vector<uint8_t> host_data;
+    for (int il = 0; il < n_layer; ++il) {
+        auto& l = model.layers[il];
+        if (!l.wkv_b || !l.wo || !l.wo->extra) continue;
+        if (!l.computed_wkv_b_replicas.empty()) continue;
+
+        auto wo_split = (const ggml_split_tensor_t *)l.wo->extra;
+        const int n_device = wo_split->n_device;
+        const size_t nbytes = ggml_nbytes(l.wkv_b);
+
+        const void * src_data = nullptr;
+        if (ggml_backend_buffer_is_host(l.wkv_b->buffer)) {
+            src_data = l.wkv_b->data;
+        } else {
+            if (host_data.size() < nbytes) host_data.resize(nbytes);
+            ggml_backend_tensor_get(l.wkv_b, host_data.data(), 0, nbytes);
+            src_data = host_data.data();
+        }
+
+        const auto name = std::string{"blk."} + std::to_string(il) + ".attn_kv_b.weight";
+
+        l.computed_wkv_b_replicas.resize(n_device);
+        l.split_wkv_b.tensor_splits.assign(n_device, nullptr);
+
+        for (int id = 0; id < n_device; ++id) {
+            if (!wo_split->splits[id] || !wo_split->splits[id]->buffer) continue;
+            auto dev_buft = ggml_backend_buffer_get_type(wo_split->splits[id]->buffer);
+            auto dev_buf  = ggml_backend_buft_alloc_buffer(dev_buft, nbytes);
+            ggml_backend_buffer_set_usage(dev_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            model.bufs.push_back(dev_buf);
+
+            l.computed_wkv_b_replicas[id] = std::make_unique<ggml_tensor>(*l.wkv_b);
+            auto rep = l.computed_wkv_b_replicas[id].get();
+            rep->buffer = dev_buf;
+            rep->data   = ggml_backend_buffer_get_base(dev_buf);
+            rep->op     = GGML_OP_NONE;
+            for (int j = 0; j < GGML_MAX_SRC; ++j) rep->src[j] = nullptr;
+            ggml_set_name(rep, (name + "." + std::to_string(id)).c_str());
+            ggml_backend_tensor_set(rep, src_data, 0, nbytes);
+            if (ggml_backend_buffer_is_host(rep->buffer)) {
+                iqk_modify_tensor(rep);
+            }
+            l.split_wkv_b.tensor_splits[id] = rep;
+        }
+
+        l.split_wkv_b.ggml.n_device  = n_device;
+        l.split_wkv_b.ggml.split_dim = -1;
+        l.split_wkv_b.ggml.splits    = l.split_wkv_b.tensor_splits.data();
+
+        printf("Replicated %s as %d x %d of type %s across %d devices for graph TP\n",
+                name.c_str(), (int)l.wkv_b->ne[0], (int)l.wkv_b->ne[1],
+                ggml_type_name(l.wkv_b->type), n_device);
+    }
 }
 
 static void llm_scale_gate_inp_s(llama_model & model, bool uses_mmap) {
@@ -3533,7 +3594,11 @@ static bool llm_load_tensors(
         const bool graph_mode = (model.split_mode == LLAMA_SPLIT_MODE_GRAPH ||
                                  model.split_mode == LLAMA_SPLIT_MODE_ATTN);
         if (!dry_run || graph_mode) {
-            llm_prepare_mla(model, mla_attn);
+            // The TP path is mla=3-shaped at runtime (mla=3 TG kernel + mla=2/3 PP via wkv_b),
+            // so force mla>=3 at prepare so wkv_b is computed regardless of user's -mla flag.
+            const int mla_for_prepare = graph_mode ? std::max(mla_attn, 3) : mla_attn;
+            llm_prepare_mla(model, mla_for_prepare);
+            if (graph_mode) llm_replicate_wkv_b_for_graph(model);
         }
     }
     if (model.arch == LLM_ARCH_GEMMA4) {

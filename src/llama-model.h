@@ -225,6 +225,7 @@ struct llama_layer {
     llama_split_tensor split_wkv_a_mqa;
     llama_split_tensor split_wk_b;
     llama_split_tensor split_wv_b;
+    llama_split_tensor split_wkv_b;
     llama_split_tensor split_attn_q_a_norm;
     llama_split_tensor split_attn_kv_a_norm;
 
@@ -384,9 +385,10 @@ struct llama_layer {
     std::unique_ptr<ggml_tensor> computed_wv_b;
     std::unique_ptr<ggml_tensor> computed_wkv_b;
 
-    // Per-device replicas of computed wk_b/wv_b (-sm graph). Buffers owned via model.bufs.
+    // Per-device replicas of computed wk_b/wv_b/wkv_b (-sm graph). Buffers owned via model.bufs.
     std::vector<std::unique_ptr<ggml_tensor>> computed_wk_b_replicas;
     std::vector<std::unique_ptr<ggml_tensor>> computed_wv_b_replicas;
+    std::vector<std::unique_ptr<ggml_tensor>> computed_wkv_b_replicas;
 };
 
 struct llama_lora_adapter;
