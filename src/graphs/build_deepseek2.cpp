@@ -139,25 +139,23 @@ ggml_tensor * llm_build_context::build_deepseek2_tp_attention(
 
         const int head_offset = head_offsets[id];
         static const bool disable_pp_opt = getenv("GGML_DISABLE_TP_PP_OPT") != nullptr;
+        // DIAGNOSTIC: temporarily letting pp_opt fire for all models. Real gate is the
+        // K_nope==V_full check above; restore it after the BF16-wkv_b test concludes.
         const bool pp_opt = !disable_pp_opt && n_tokens >= 128;
 
         ggml_tensor * kqv_2d;
 
         if (pp_opt && model.layers[il].split_wkv_b.ggml.splits) {
             // mla=2/3 PP path: materialize K/V per rank from compressed cache via wkv_b.
+            // wkv_b is per-rank sliced at load time (llm_replicate_wkv_b_for_graph), so the
+            // device's tensor is already this rank's heads only — use it directly.
             const auto * wkv_b_split = (const ggml_split_tensor_t *)&model.layers[il].split_wkv_b.ggml;
-            ggml_tensor * wkv_b_local = wkv_b_split->splits[id];
-            GGML_ASSERT(wkv_b_local);
+            ggml_tensor * wkv_b_slice = wkv_b_split->splits[id];
+            GGML_ASSERT(wkv_b_slice);
+            (void)head_offset;  // already baked into the per-rank slice at load time
 
             const int n_embd_head_v_full = hparams.n_embd_head_v_full;
             const int n_per_head = n_embd_head_qk_nope + n_embd_head_v_full;
-
-            ggml_tensor * wkv_b_slice = ggml_view_2d(ctx0, wkv_b_local,
-                    wkv_b_local->ne[0],
-                    n_head_local * n_per_head,
-                    wkv_b_local->nb[1],
-                    wkv_b_local->nb[1] * head_offset * n_per_head);
-            cb(wkv_b_slice, "wkv_b_slice", il_id);
 
             ggml_tensor * kv_cache_nope = ggml_view_2d(ctx0, cache_local,
                     kv_lora_rank, n_kv,

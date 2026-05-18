@@ -2432,6 +2432,15 @@ static void llm_prepare_mla(llama_model & model, int mla) {
 
     if (mla == 1) return;
 
+    static const bool force_compute_wkv_b = getenv("GGML_FORCE_COMPUTE_WKV_B") != nullptr;
+    if (force_compute_wkv_b) {
+        for (auto& l : model.layers) {
+            if (l.wk_b && l.wv_b && l.wkv_b && l.computed_wkv_b.get() != l.wkv_b) {
+                l.wkv_b = nullptr;
+            }
+        }
+    }
+
     n_to_compute = 0;
     for (auto& l : model.layers) {
         if (l.wk_b && l.wv_b && !l.wkv_b) ++n_to_compute;
@@ -2468,16 +2477,24 @@ static void llm_prepare_mla(llama_model & model, int mla) {
         if (l.wkv_b || !l.wk_b || !l.wv_b) continue;
         auto wk_b = *l.wk_b;
         auto wv_b = *l.wv_b;
-        if (!ggml_backend_buffer_is_host(l.wk_b->buffer)) {
-            auto nbytes = ggml_nbytes(l.wk_b);
+        auto wk_src = l.wk_b;
+        auto wv_src = l.wv_b;
+        if (!wk_src->buffer && !l.computed_wk_b_replicas.empty() && l.computed_wk_b_replicas[0]) {
+            wk_src = l.computed_wk_b_replicas[0].get();
+        }
+        if (!wv_src->buffer && !l.computed_wv_b_replicas.empty() && l.computed_wv_b_replicas[0]) {
+            wv_src = l.computed_wv_b_replicas[0].get();
+        }
+        if (!ggml_backend_buffer_is_host(wk_src->buffer)) {
+            auto nbytes = ggml_nbytes(wk_src);
             if (wk_buffer.size() < nbytes) wk_buffer.resize(nbytes);
-            ggml_backend_tensor_get(l.wk_b, wk_buffer.data(), 0, nbytes);
+            ggml_backend_tensor_get(wk_src, wk_buffer.data(), 0, nbytes);
             wk_b.data = wk_buffer.data();
         }
-        if (!ggml_backend_buffer_is_host(l.wv_b->buffer)) {
-            auto nbytes = ggml_nbytes(l.wv_b);
+        if (!ggml_backend_buffer_is_host(wv_src->buffer)) {
+            auto nbytes = ggml_nbytes(wv_src);
             if (wv_buffer.size() < nbytes) wv_buffer.resize(nbytes);
-            ggml_backend_tensor_get(l.wv_b, wv_buffer.data(), 0, nbytes);
+            ggml_backend_tensor_get(wv_src, wv_buffer.data(), 0, nbytes);
             wv_b.data = wv_buffer.data();
         }
 
@@ -2543,7 +2560,7 @@ static void llm_prepare_mla(llama_model & model, int mla) {
         auto name = std::string{"blk."} + std::to_string(il) + ".attn_kv_b.weight";
 
         l.computed_wkv_b = std::make_unique<ggml_tensor>(*wkv_b);
-        l.computed_wkv_b->buffer = ggml_backend_buft_alloc_buffer(ggml_backend_buffer_get_type(l.wk_b->buffer), ggml_nbytes(wkv_b));
+        l.computed_wkv_b->buffer = ggml_backend_buft_alloc_buffer(ggml_backend_buffer_get_type(wk_src->buffer), ggml_nbytes(wkv_b));
         l.computed_wkv_b->data   = ggml_backend_buffer_get_base(l.computed_wkv_b->buffer);
         l.computed_wkv_b->op = GGML_OP_NONE; // we absolutely need to do this, else the backend will attempt to find the parents
                                              // of wkv_b, which no longer exist, and will therefore crash.
@@ -2566,11 +2583,13 @@ static void llm_prepare_mla(llama_model & model, int mla) {
     ggml_free(ctx);
 }
 
-// Replicate wkv_b across devices so build_deepseek2_tp_attention's pp_opt path can take
-// per-rank slices. Called after llm_prepare_mla so wkv_b is guaranteed present.
+// Per-rank slice of wkv_b for graph TP. Each device gets only its rank's heads as a
+// standalone contiguous tensor (no view-with-offset). pp_opt uses it directly as src0
+// for mul_mat; avoids the CUDA mul_mat-with-sliced-view bug observed on GLM-4.7-Flash.
 static void llm_replicate_wkv_b_for_graph(llama_model & model) {
     if (model.split_mode != LLAMA_SPLIT_MODE_GRAPH && model.split_mode != LLAMA_SPLIT_MODE_ATTN) return;
     const int n_layer = model.hparams.n_layer;
+    const auto & hparams = model.hparams;
     std::vector<uint8_t> host_data;
     for (int il = 0; il < n_layer; ++il) {
         auto& l = model.layers[il];
@@ -2579,14 +2598,19 @@ static void llm_replicate_wkv_b_for_graph(llama_model & model) {
 
         auto wo_split = (const ggml_split_tensor_t *)l.wo->extra;
         const int n_device = wo_split->n_device;
-        const size_t nbytes = ggml_nbytes(l.wkv_b);
+        const size_t nbytes_full = ggml_nbytes(l.wkv_b);
+
+        const uint32_t n_head_layer  = hparams.n_head(il);
+        const int64_t  n_per_head    = l.wkv_b->ne[1] / (int64_t)n_head_layer;
+        const uint32_t n_embd_head_v = hparams.n_embd_head_v(il);
+        const size_t   row_size      = l.wkv_b->nb[1];
 
         const void * src_data = nullptr;
         if (ggml_backend_buffer_is_host(l.wkv_b->buffer)) {
             src_data = l.wkv_b->data;
         } else {
-            if (host_data.size() < nbytes) host_data.resize(nbytes);
-            ggml_backend_tensor_get(l.wkv_b, host_data.data(), 0, nbytes);
+            if (host_data.size() < nbytes_full) host_data.resize(nbytes_full);
+            ggml_backend_tensor_get(l.wkv_b, host_data.data(), 0, nbytes_full);
             src_data = host_data.data();
         }
 
@@ -2595,21 +2619,47 @@ static void llm_replicate_wkv_b_for_graph(llama_model & model) {
         l.computed_wkv_b_replicas.resize(n_device);
         l.split_wkv_b.tensor_splits.assign(n_device, nullptr);
 
+        std::vector<int> head_offsets(n_device + 1, 0);
+        for (int idx = 0; idx < n_device; ++idx) {
+            int n_h_id = 0;
+            if (wo_split->splits[idx]) {
+                n_h_id = (int)(wo_split->splits[idx]->ne[0] / n_embd_head_v);
+            }
+            head_offsets[idx + 1] = head_offsets[idx] + n_h_id;
+        }
+
         for (int id = 0; id < n_device; ++id) {
             if (!wo_split->splits[id] || !wo_split->splits[id]->buffer) continue;
+
+            const int head_offset  = head_offsets[id];
+            const int n_head_local = head_offsets[id + 1] - head_offset;
+            if (n_head_local <= 0) continue;
+
+            const int64_t slice_cols       = (int64_t)n_head_local * n_per_head;
+            const size_t  slice_bytes      = (size_t)slice_cols * row_size;
+            const size_t  src_offset_bytes = (size_t)head_offset * (size_t)n_per_head * row_size;
+
             auto dev_buft = ggml_backend_buffer_get_type(wo_split->splits[id]->buffer);
-            auto dev_buf  = ggml_backend_buft_alloc_buffer(dev_buft, nbytes);
+            auto dev_buf  = ggml_backend_buft_alloc_buffer(dev_buft, slice_bytes);
             ggml_backend_buffer_set_usage(dev_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             model.bufs.push_back(dev_buf);
 
             l.computed_wkv_b_replicas[id] = std::make_unique<ggml_tensor>(*l.wkv_b);
             auto rep = l.computed_wkv_b_replicas[id].get();
+            rep->ne[1] = slice_cols;
+            rep->ne[2] = 1;
+            rep->ne[3] = 1;
+            rep->nb[2] = rep->nb[1] * (size_t)rep->ne[1];
+            rep->nb[3] = rep->nb[2] * (size_t)rep->ne[2];
             rep->buffer = dev_buf;
             rep->data   = ggml_backend_buffer_get_base(dev_buf);
             rep->op     = GGML_OP_NONE;
             for (int j = 0; j < GGML_MAX_SRC; ++j) rep->src[j] = nullptr;
+            rep->view_src = nullptr;
+            rep->view_offs = 0;
+            rep->extra = nullptr;
             ggml_set_name(rep, (name + "." + std::to_string(id)).c_str());
-            ggml_backend_tensor_set(rep, src_data, 0, nbytes);
+            ggml_backend_tensor_set(rep, (const uint8_t *)src_data + src_offset_bytes, 0, slice_bytes);
             if (ggml_backend_buffer_is_host(rep->buffer)) {
                 iqk_modify_tensor(rep);
             }
@@ -2620,7 +2670,7 @@ static void llm_replicate_wkv_b_for_graph(llama_model & model) {
         l.split_wkv_b.ggml.split_dim = -1;
         l.split_wkv_b.ggml.splits    = l.split_wkv_b.tensor_splits.data();
 
-        printf("Replicated %s as %d x %d of type %s across %d devices for graph TP\n",
+        printf("Per-rank sliced %s (%d x %d of type %s) across %d devices for graph TP\n",
                 name.c_str(), (int)l.wkv_b->ne[0], (int)l.wkv_b->ne[1],
                 ggml_type_name(l.wkv_b->type), n_device);
     }
